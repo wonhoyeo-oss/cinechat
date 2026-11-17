@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import re
+import time
 from datetime import datetime, timedelta
 
 from . import services
@@ -26,6 +27,7 @@ SYSTEM_PROMPT = """너는 영화관 'CineChat'의 친절한 예매 도우미야.
 - 실제 결제(book_seats)는 사용자가 영화·회차·좌석·금액을 확인하고 "예매해줘/결제해줘"처럼 명확히 동의했을 때만 호출해. 좌석을 지정하지 않았으면 get_seat_map 으로 빈 좌석 중 가운데 쪽 연석을 골라 제안해.
 - 사용자가 화면에서 직접 좌석을 고르고 싶어 하면 open_booking_screen 을 호출해.
 - 로그인하지 않은 상태({login})라면 결제 전에 로그인이 필요하다고 안내해.
+- 응답 속도가 중요해. 필요한 도구는 한 번에 같이 호출하고, 이미 받은 정보로 답할 수 있으면 도구를 다시 부르지 마.
 - 답변은 한국어로, 3~6문장 정도로 간결하게. 금액은 '12,000원'처럼 표기해."""
 
 TOOLS = [
@@ -112,6 +114,8 @@ class ToolRunner:
         self.screenings: list[dict] = []
         self.action: dict | None = None
         self.booking: dict | None = None
+        self.started = time.perf_counter()
+        self.llm_calls = 0
 
     def run(self, name: str, args: dict) -> dict:
         try:
@@ -186,6 +190,8 @@ class ToolRunner:
         return {
             "reply": reply,
             "engine": engine,
+            "elapsed": round(time.perf_counter() - self.started, 2),   # 응답 시간(초) - 성능 평가용
+            "llm_calls": self.llm_calls,
             "movies": list(self.movies.values())[:6],
             "screenings": self.screenings[:12],
             "action": self.action,
@@ -211,6 +217,17 @@ def _system_prompt(user: dict | None) -> str:
         today=now.strftime("%Y-%m-%d"), weekday=WEEKDAYS[now.weekday()] + "요일", now=now.strftime("%H:%M"),
         login=f"로그인: {user['nickname']}님, 포인트 {user['points']:,}P" if user else "로그인 안 함",
     )
+
+
+def _thinking_config(types):
+    """GEMINI_THINKING = MINIMAL | LOW | MEDIUM | HIGH | OFF (기본 LOW)"""
+    level = os.getenv("GEMINI_THINKING", "LOW").strip().upper()
+    if level in ("", "OFF", "DEFAULT"):
+        return None
+    try:
+        return types.ThinkingConfig(thinking_level=types.ThinkingLevel[level])
+    except KeyError:
+        return types.ThinkingConfig(thinking_level=types.ThinkingLevel.LOW)
 
 
 class RateLimitError(Exception):
@@ -241,6 +258,8 @@ def _gemini_chat(conn, messages: list[dict], user: dict | None, cfg: dict) -> di
         tools=[types.Tool(function_declarations=declarations)],
         automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),  # 도구 실행은 직접 제어
         temperature=0.6,
+        # 영화 추천·예매는 깊은 추론이 필요 없으므로 '생각' 단계를 줄여 응답 속도를 높인다
+        thinking_config=_thinking_config(types),
     )
     # Gemini 는 assistant 대신 'model' 역할을 쓰고, 대화는 user 로 시작해야 한다
     contents = []
@@ -252,12 +271,21 @@ def _gemini_chat(conn, messages: list[dict], user: dict | None, cfg: dict) -> di
 
     runner = ToolRunner(conn, user)
     for _ in range(6):  # 도구 호출 루프 (무한 루프 방지)
+        t0 = time.perf_counter()
         try:
             resp = client.models.generate_content(model=model, contents=contents, config=config)
         except errors.ClientError as e:
             if e.code == 429:
                 raise RateLimitError() from e
-            raise
+            if e.code == 400 and config.thinking_config is not None:
+                # 생각 수준 설정을 지원하지 않는 모델이면 설정을 빼고 한 번 더 시도
+                log.warning("thinking_config 미지원 모델(%s) → 기본 설정으로 재시도", model)
+                config.thinking_config = None
+                resp = client.models.generate_content(model=model, contents=contents, config=config)
+            else:
+                raise
+        runner.llm_calls += 1
+        log.info("gemini 호출 %d회차: %.2f초", runner.llm_calls, time.perf_counter() - t0)
         calls = resp.function_calls or []
         if not calls:
             return runner.result((resp.text or "").strip() or "죄송해요, 다시 한 번 말씀해 주시겠어요?", engine)
