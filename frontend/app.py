@@ -373,6 +373,8 @@ with chat_col:
         for idx, msg in enumerate(ss.messages):
             with st.chat_message(msg["role"], avatar="🎬" if msg["role"] == "assistant" else "🙂"):
                 st.markdown(msg["content"])
+                if msg.get("meta"):
+                    st.caption(msg["meta"])
                 if msg.get("movies"):
                     card_grid(msg["movies"][:4], f"chat{idx}", per_row=4)
 
@@ -396,7 +398,8 @@ with chat_col:
         if err:
             ss.messages.append({"role": "assistant", "content": f"⚠️ {err}"})
         else:
-            ss.messages.append({"role": "assistant", "content": data["reply"], "movies": data.get("movies")})
+            ss.messages.append({"role": "assistant", "content": data["reply"], "movies": data.get("movies"),
+                                "meta": f"⏱ {data.get('elapsed', 0):.1f}초 · {data.get('engine', '')}"})
             action = data.get("action") or {}
             if action.get("type") == "open_booking":
                 open_booking(screening_id=action["screening_id"], seats=action.get("seats"))
