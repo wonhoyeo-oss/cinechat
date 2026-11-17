@@ -378,7 +378,9 @@ with chat_col:
                 if msg.get("movies"):
                     card_grid(msg["movies"][:4], f"chat{idx}", per_row=4)
 
-    examples = ["요즘 인기 영화 뭐야?", "비 오는 날 혼자 보기 좋은 영화", "인셉션 내일 저녁 7시 두 명 예매해줘",
+    _top, _ = api("GET", "/api/movies/boxoffice")
+    _title = _top[0]["title"] if _top else "인셉션"   # 실제 상영 1위 영화로 예시 문장 생성
+    examples = ["요즘 인기 영화 뭐야?", "비 오는 날 혼자 보기 좋은 영화", f"{_title} 내일 저녁 7시 두 명 예매해줘",
                 "내 예매 내역 보여줘"]
     ex_cols = st.container(key="examples").columns(len(examples))
     clicked = None
