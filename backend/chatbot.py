@@ -234,20 +234,86 @@ class RateLimitError(Exception):
     """무료 티어 호출 한도 초과"""
 
 
+_DISCOVERED_MODELS: list[str] | None = None
+
+
+def _discover_fallback_models(client, exclude: str) -> list[str]:
+    """API 키로 사용 가능한 Gemini 모델 목록을 조회해, 가벼운(flash/lite) 모델을 대체 후보로 고른다.
+    모델 이름이 자주 바뀌므로 하드코딩 대신 실제 목록에서 찾는다. (결과는 프로세스 동안 캐시)"""
+    global _DISCOVERED_MODELS
+    if _DISCOVERED_MODELS is None:
+        found = []
+        try:
+            for m in client.models.list(config={"page_size": 100}):
+                name = (m.name or "").removeprefix("models/")
+                actions = m.supported_actions or []
+                if "generateContent" not in actions or not name.startswith("gemini"):
+                    continue
+                if any(x in name for x in ("image", "tts", "audio", "live", "embedding", "robotics", "computer")):
+                    continue
+                if "flash" in name or "lite" in name:
+                    found.append(name)
+        except Exception as e:
+            log.warning("Gemini 모델 목록 조회 실패: %s", e)
+        # 정식 버전 우선, preview/exp 는 뒤로
+        found.sort(key=lambda n: (("preview" in n) or ("exp" in n), "lite" not in n, n))
+        _DISCOVERED_MODELS = found
+        log.info("대체 모델 후보: %s", found[:5])
+    return [m for m in _DISCOVERED_MODELS if m != exclude]
+
+
+def _gemini_candidates(client, primary: str) -> list[str]:
+    env = [m.strip() for m in os.getenv("GEMINI_FALLBACK_MODELS", "").split(",") if m.strip()]
+    out = [primary] + [m for m in env if m != primary]
+    if os.getenv("GEMINI_AUTO_FALLBACK", "1") != "0":
+        out += [m for m in _discover_fallback_models(client, primary) if m not in out][:2]
+    return out
+
+
 def _gemini_chat(conn, messages: list[dict], user: dict | None, cfg: dict) -> dict:
     """Google 공식 google-genai SDK 로 Function Calling.
     모델 응답(Content)을 그대로 대화 기록에 다시 넣기 때문에, Gemini 3 의 'thought signature'
-    (함수 호출 사이의 추론 맥락)가 보존되어 여러 번 이어지는 도구 호출도 안정적으로 동작한다."""
+    (함수 호출 사이의 추론 맥락)가 보존되어 여러 번 이어지는 도구 호출도 안정적으로 동작한다.
+    기본 모델이 과부하(5xx)·한도 초과(429)·미지원(404)이면 다른 Gemini 모델로 자동 전환한다."""
     from google import genai
     from google.genai import errors, types
 
     client = genai.Client(api_key=cfg["api_key"], http_options=types.HttpOptions(
         timeout=40_000,
-        retry_options=types.HttpRetryOptions(attempts=3, initial_delay=1.5, http_status_codes=[500, 502, 503, 504]),
+        retry_options=types.HttpRetryOptions(attempts=2, initial_delay=1.0, http_status_codes=[500, 502, 503, 504]),
     ))
-    model = cfg["model"]
-    engine = f"gemini:{model}"
+    started = time.perf_counter()
+    last_err: Exception | None = None
+    all_rate_limited = True
+    tried = []
+    candidates = [cfg["model"]]
+    i = 0
+    while i < len(candidates):
+        model = candidates[i]
+        tried.append(model)
+        try:
+            out = _gemini_run(client, errors, types, conn, messages, user, model)
+            out["elapsed"] = round(time.perf_counter() - started, 2)
+            if len(tried) > 1:
+                log.warning("기본 모델 실패 → %s 로 응답 (시도: %s)", model, tried)
+            return out
+        except (errors.ServerError, errors.ClientError) as e:
+            code = getattr(e, "code", None)
+            if isinstance(e, errors.ClientError) and code not in (404, 429):
+                raise                       # 키 오류 등은 다른 모델로 바꿔도 해결되지 않음
+            log.warning("Gemini 모델 %s 실패(%s) → 다른 모델 시도", model, code)
+            last_err = e
+            all_rate_limited = all_rate_limited and code == 429
+        if i == 0:   # 기본 모델이 실패했을 때만 대체 후보를 조회
+            candidates = _gemini_candidates(client, cfg["model"])
+        i += 1
+    if all_rate_limited:
+        raise RateLimitError() from last_err
+    raise last_err
 
+
+def _gemini_run(client, errors, types, conn, messages, user, model) -> dict:
+    engine = f"gemini:{model}"
     declarations = [types.FunctionDeclaration(
         name=t["function"]["name"],
         description=t["function"]["description"],
@@ -275,8 +341,6 @@ def _gemini_chat(conn, messages: list[dict], user: dict | None, cfg: dict) -> di
         try:
             resp = client.models.generate_content(model=model, contents=contents, config=config)
         except errors.ClientError as e:
-            if e.code == 429:
-                raise RateLimitError() from e
             if e.code == 400 and config.thinking_config is not None:
                 # 생각 수준 설정을 지원하지 않는 모델이면 설정을 빼고 한 번 더 시도
                 log.warning("thinking_config 미지원 모델(%s) → 기본 설정으로 재시도", model)
@@ -285,7 +349,7 @@ def _gemini_chat(conn, messages: list[dict], user: dict | None, cfg: dict) -> di
             else:
                 raise
         runner.llm_calls += 1
-        log.info("gemini 호출 %d회차: %.2f초", runner.llm_calls, time.perf_counter() - t0)
+        log.info("gemini(%s) 호출 %d회차: %.2f초", model, runner.llm_calls, time.perf_counter() - t0)
         calls = resp.function_calls or []
         if not calls:
             return runner.result((resp.text or "").strip() or "죄송해요, 다시 한 번 말씀해 주시겠어요?", engine)
@@ -455,11 +519,19 @@ def _rule_chat(conn, messages: list[dict], user: dict | None) -> dict:
         head = f"{genre} 장르로 골라봤어요." if genre else "고민되신다면 요즘 인기작부터 추천드려요."
         return runner.result(head + "\n" + "\n".join(lines) + "\n\n마음에 드는 영화 제목을 말씀해 주시면 상영 시간을 알려드릴게요.", "rule")
 
+    if re.search(r"예매|예약", text):
+        out = runner.t_get_box_office(5)
+        names = ", ".join(m["title"] for m in out["box_office"])
+        return runner.result("말씀하신 영화를 현재 상영작에서 찾지 못했어요. "
+                             f"지금 상영 중인 인기작은 {names} 이에요. 영화 제목을 정확히 말씀해 주세요.", "rule")
+
+    top = services.box_office(conn, limit=1)
+    sample_title = top[0]["title"] if top else "인셉션"
+    note = "" if llm_config() else "\n(현재 AI API 키가 없어 키워드 기반 모드로 동작 중입니다)"
     return runner.result(
         "안녕하세요! CineChat 예매 도우미예요 🎬\n"
-        "• \"요즘 인기 영화 뭐야?\"\n• \"우울한데 웃긴 영화 추천해줘\"\n• \"인셉션 내일 저녁 7시 2명 예매해줘\"\n"
-        "• \"내 예매 내역 보여줘\" 처럼 편하게 말씀해 주세요.\n"
-        "(현재 GEMINI_API_KEY 가 없어 키워드 기반 모드로 동작 중입니다)", "rule")
+        f"• \"요즘 인기 영화 뭐야?\"\n• \"우울한데 웃긴 영화 추천해줘\"\n• \"{sample_title} 내일 저녁 7시 2명 예매해줘\"\n"
+        "• \"내 예매 내역 보여줘\" 처럼 편하게 말씀해 주세요." + note, "rule")
 
 
 def chat(conn, messages: list[dict], user: dict | None) -> dict:
@@ -480,6 +552,8 @@ def chat(conn, messages: list[dict], user: dict | None) -> dict:
             elif getattr(e, "code", None) == 404:
                 out["reply"] += "\n\n(⚠️ 모델 이름을 찾을 수 없어요. .env 의 GEMINI_MODEL 을 AI Studio 에 표시된 모델명으로 바꿔 주세요.)"
             else:
-                out["reply"] += f"\n\n(⚠️ AI 서버 연결 실패로 키워드 모드로 응답했어요: {type(e).__name__})"
+                code = getattr(e, "code", "")
+                out["reply"] += (f"\n\n(⚠️ AI 서버가 응답하지 않아 키워드 모드로 답했어요: {type(e).__name__} {code}. "
+                                 "구글 서버가 붐비는 중일 수 있어요. 잠시 후 다시 시도해 주세요.)")
             return out
     return _rule_chat(conn, messages, user)
