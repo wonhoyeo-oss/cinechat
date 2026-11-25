@@ -31,8 +31,8 @@ def new_user(client, name):
 
 def future_screening(client):
     movie = client.get("/api/movies").json()[0]
-    shows = client.get(f"/api/movies/{movie['id']}/screenings").json()
-    assert shows, "예매 가능한 회차가 있어야 함"
+    shows = [s for s in client.get(f"/api/movies/{movie['id']}/screenings").json() if s["total_seats"] >= 96]
+    assert shows, "예매 가능한 일반관(96석) 회차가 있어야 함"
     return shows[0]
 
 

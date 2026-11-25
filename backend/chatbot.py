@@ -26,6 +26,8 @@ SYSTEM_PROMPT = """너는 영화관 'CineChat'의 친절한 예매 도우미야.
 - 예매 요청이 오면 get_showtimes 로 회차를 찾고, 날짜/시간/인원이 불분명하면 짧게 되물어.
 - 실제 결제(book_seats)는 사용자가 영화·회차·좌석·금액을 확인하고 "예매해줘/결제해줘"처럼 명확히 동의했을 때만 호출해. 좌석을 지정하지 않았으면 get_seat_map 으로 빈 좌석 중 가운데 쪽 연석을 골라 제안해.
 - 사용자가 화면에서 직접 좌석을 고르고 싶어 하면 open_booking_screen 을 호출해.
+- 원하는 회차가 매진이거나 남은 좌석이 인원보다 적으면, 다른 회차를 먼저 제안하고 '취소표 대기'도 안내해. 대기 신청(join_waitlist)을 하면 취소표가 나올 때 신청 순서대로 자동 예매되고 포인트가 자동 결제된다는 점을 설명하고, 사용자가 동의하면 호출해.
+- 대기 현황을 물으면 get_my_waitlist 로 순번과 상태를 알려줘.
 - 로그인하지 않은 상태({login})라면 결제 전에 로그인이 필요하다고 안내해.
 - 응답 속도가 중요해. 필요한 도구는 한 번에 같이 호출하고, 이미 받은 정보로 답할 수 있으면 도구를 다시 부르지 마.
 - 답변은 한국어로, 3~6문장 정도로 간결하게. 금액은 '12,000원'처럼 표기해."""
@@ -76,6 +78,19 @@ TOOLS = [
         }},
     }},
     {"type": "function", "function": {
+        "name": "join_waitlist",
+        "description": "매진(또는 잔여석이 인원보다 적은) 회차에 취소표 대기 신청을 한다. 취소표가 나오면 신청 순서대로 자동 예매·자동 결제된다. 사용자가 동의한 뒤에만 호출.",
+        "parameters": {"type": "object", "required": ["screening_id", "seat_count"], "properties": {
+            "screening_id": {"type": "integer"},
+            "seat_count": {"type": "integer", "description": "원하는 좌석 수 (1~4)"},
+        }},
+    }},
+    {"type": "function", "function": {
+        "name": "get_my_waitlist",
+        "description": "로그인한 사용자의 취소표 대기 신청 목록(대기 순번, 상태)을 조회한다.",
+        "parameters": {"type": "object", "properties": {}},
+    }},
+    {"type": "function", "function": {
         "name": "get_my_bookings",
         "description": "로그인한 사용자의 예매 내역과 포인트 잔액을 조회한다.",
         "parameters": {"type": "object", "properties": {}},
@@ -89,19 +104,7 @@ def _slim_movie(m: dict) -> dict:
     return {k: m.get(k) for k in ("id", "title", "genres", "overview", "release_year", "runtime", "rating", "box_rank")}
 
 
-def suggest_seats(seatmap: dict, count: int) -> list[str]:
-    """빈 좌석 중 스크린 중앙·약간 뒤쪽의 연속 좌석을 고른다."""
-    rows, cols, taken = seatmap["rows"], seatmap["cols"], set(seatmap["taken"])
-    best_rows = sorted(rows, key=lambda r: abs(rows.index(r) - (len(rows) * 0.6)))
-    center = (cols + 1) / 2
-    for r in best_rows:
-        starts = sorted(range(1, cols - count + 2), key=lambda c: abs(c + (count - 1) / 2 - center))
-        for c in starts:
-            block = [f"{r}{c + i}" for i in range(count)]
-            if not taken.intersection(block):
-                return block
-    free = [f"{r}{c}" for r in rows for c in range(1, cols + 1) if f"{r}{c}" not in taken]
-    return free[:count]
+suggest_seats = services.suggest_seats   # 좌석 추천 로직은 services.py 로 이동 (대기열 자동 배정과 공유)
 
 
 class ToolRunner:
@@ -160,8 +163,9 @@ class ToolRunner:
     def t_get_seat_map(self, screening_id):
         sm = services.seat_map(self.conn, int(screening_id))
         return {"rows": sm["rows"], "cols": sm["cols"], "taken": sm["taken"], "remaining": sm["remaining"],
-                "recommended_pair": suggest_seats(sm, 2), "price": sm["screening"]["price"],
-                "note": "A열이 스크린에 가장 가깝다."}
+                "sold_out": sm["remaining"] == 0, "waiting_users": sm["waiting"],
+                "recommended_pair": suggest_seats(sm, 2) if sm["remaining"] >= 2 else [],
+                "price": sm["screening"]["price"], "note": "A열이 스크린에 가장 가깝다."}
 
     def t_open_booking_screen(self, screening_id, seats=None):
         scr = services.get_screening(self.conn, int(screening_id))
@@ -178,6 +182,19 @@ class ToolRunner:
         self.action = {"type": "booked", "booking_id": b["id"]}
         left = self.conn.execute("SELECT points FROM users WHERE id=?", (self.user["id"],)).fetchone()[0]
         return {"ok": True, "booking": b, "points_left": left}
+
+    def t_join_waitlist(self, screening_id, seat_count):
+        if not self.user:
+            return {"error": "로그인이 필요합니다. 왼쪽 사이드바에서 로그인해 주세요."}
+        w = services.join_waitlist(self.conn, self.user["id"], int(screening_id), int(seat_count))
+        self.action = {"type": "waitlisted", "waitlist_id": w["id"], "screening_id": w["screening_id"]}
+        return {"ok": True, "waitlist": w,
+                "note": f"대기 {w['position']}번째. 취소표가 나오면 자동 예매되고 {w['price'] * w['seat_count']:,}P가 결제됨"}
+
+    def t_get_my_waitlist(self):
+        if not self.user:
+            return {"error": "로그인이 필요합니다."}
+        return {"waitlist": services.my_waitlist(self.conn, self.user["id"])[:10]}
 
     def t_get_my_bookings(self):
         if not self.user:
@@ -235,6 +252,9 @@ class RateLimitError(Exception):
 
 
 _DISCOVERED_MODELS: list[str] | None = None
+_MODEL_COOLDOWN: dict[str, float] = {}   # 모델명 → 다시 시도해도 되는 시각 (실패한 모델은 잠시 건너뜀)
+COOLDOWN_SEC = 600
+_LAST_GOOD_MODEL: str | None = None
 
 
 def _discover_fallback_models(client, exclude: str) -> list[str]:
@@ -278,15 +298,24 @@ def _gemini_chat(conn, messages: list[dict], user: dict | None, cfg: dict) -> di
     from google import genai
     from google.genai import errors, types
 
-    client = genai.Client(api_key=cfg["api_key"], http_options=types.HttpOptions(
-        timeout=40_000,
-        retry_options=types.HttpRetryOptions(attempts=2, initial_delay=1.0, http_status_codes=[500, 502, 503, 504]),
-    ))
+    global _LAST_GOOD_MODEL
+    # 재시도 없이 빠르게 실패시키고(최대 25초), 실패하면 다른 모델로 넘어간다
+    client = genai.Client(api_key=cfg["api_key"], http_options=types.HttpOptions(timeout=25_000))
     started = time.perf_counter()
     last_err: Exception | None = None
     all_rate_limited = True
     tried = []
-    candidates = [cfg["model"]]
+    now = time.time()
+    primary = cfg["model"]
+    # 기본 모델이 최근에 실패했다면 건너뛰고, 직전에 성공한 대체 모델부터 바로 사용
+    if _MODEL_COOLDOWN.get(primary, 0) > now:
+        candidates = [m for m in ([_LAST_GOOD_MODEL] if _LAST_GOOD_MODEL else []) + _gemini_candidates(client, primary)
+                      if m and _MODEL_COOLDOWN.get(m, 0) <= now]
+        candidates = list(dict.fromkeys(candidates)) or [primary]
+        discovered = True
+    else:
+        candidates = [primary]
+        discovered = False
     i = 0
     while i < len(candidates):
         model = candidates[i]
@@ -294,18 +323,28 @@ def _gemini_chat(conn, messages: list[dict], user: dict | None, cfg: dict) -> di
         try:
             out = _gemini_run(client, errors, types, conn, messages, user, model)
             out["elapsed"] = round(time.perf_counter() - started, 2)
-            if len(tried) > 1:
-                log.warning("기본 모델 실패 → %s 로 응답 (시도: %s)", model, tried)
+            _LAST_GOOD_MODEL = model
+            if len(tried) > 1 or model != primary:
+                log.warning("기본 모델 대신 %s 로 응답 (시도: %s)", model, tried)
             return out
         except (errors.ServerError, errors.ClientError) as e:
             code = getattr(e, "code", None)
             if isinstance(e, errors.ClientError) and code not in (404, 429):
                 raise                       # 키 오류 등은 다른 모델로 바꿔도 해결되지 않음
-            log.warning("Gemini 모델 %s 실패(%s) → 다른 모델 시도", model, code)
+            log.warning("Gemini 모델 %s 실패(%s) → %d초간 건너뛰고 다른 모델 시도", model, code, COOLDOWN_SEC)
+            _MODEL_COOLDOWN[model] = time.time() + COOLDOWN_SEC
             last_err = e
             all_rate_limited = all_rate_limited and code == 429
-        if i == 0:   # 기본 모델이 실패했을 때만 대체 후보를 조회
-            candidates = _gemini_candidates(client, cfg["model"])
+        except Exception as e:              # 타임아웃 등 네트워크 오류도 다른 모델로
+            if "timeout" not in type(e).__name__.lower() and "Timeout" not in str(e):
+                raise
+            log.warning("Gemini 모델 %s 응답 시간 초과 → 다른 모델 시도", model)
+            _MODEL_COOLDOWN[model] = time.time() + COOLDOWN_SEC
+            last_err = e
+            all_rate_limited = False
+        if not discovered:   # 기본 모델이 실패했을 때만 대체 후보를 조회
+            candidates += [m for m in _gemini_candidates(client, primary) if m not in candidates]
+            discovered = True
         i += 1
     if all_rate_limited:
         raise RateLimitError() from last_err
@@ -469,6 +508,17 @@ def _rule_chat(conn, messages: list[dict], user: dict | None) -> dict:
             if movie:
                 break
 
+    if re.search(r"대기 ?(현황|목록|내역|순번|상태)|내 ?대기", text):
+        out = runner.t_get_my_waitlist()
+        if "error" in out:
+            return runner.result(out["error"], "rule")
+        label = {"WAITING": "대기 중", "FULFILLED": "자동 예매 완료", "FAILED": "실패", "CANCELLED": "취소",
+                 "EXPIRED": "만료"}
+        lines = [f"- {w['title']} · {w['starts_at']} · {w['seat_count']}석 · {label.get(w['status'], w['status'])}"
+                 + (f" ({w['position']}번째)" if w["position"] else "") for w in out["waitlist"][:5]]
+        return runner.result("취소표 대기 현황이에요.\n" + "\n".join(lines) if lines
+                             else "대기 신청 내역이 없어요.", "rule")
+
     if re.search(r"내 ?예매|예매 ?내역|포인트 ?잔액|내 ?포인트", text):
         out = runner.t_get_my_bookings()
         if "error" in out:
@@ -488,6 +538,16 @@ def _rule_chat(conn, messages: list[dict], user: dict | None) -> dict:
             return runner.result(f"'{movie['title']}'의 {'해당 날짜 ' if date else ''}남은 상영 회차가 없어요. 다른 날짜를 말씀해 주세요.", "rule")
         pick = min(shows, key=lambda s: abs(int(s["starts_at"][11:13]) - hour)) if hour is not None else shows[0]
         sm = services.seat_map(conn, pick["id"])
+        if sm["remaining"] < count:
+            runner.t_open_booking_screen(pick["id"], [])
+            others = [s_ for s_ in shows if s_["remaining_seats"] >= count and s_["id"] != pick["id"]][:2]
+            alt = ", ".join(f"{o['starts_at'][5:]} {o['theater']}" for o in others)
+            state = "매진" if sm["remaining"] == 0 else f"남은 좌석이 {sm['remaining']}석뿐"
+            return runner.result(
+                f"'{movie['title']}' {pick['starts_at']} {pick['theater']} 회차는 {state}이에요. "
+                + (f"대신 {alt} 회차는 자리가 있어요. " if alt else "")
+                + "예매 창에서 '취소표 대기 신청'을 누르시면 취소표가 나올 때 신청 순서대로 자동 예매해 드려요.",
+                "rule")
         seats = suggest_seats(sm, count)
         runner.t_open_booking_screen(pick["id"], seats)
         total = pick["price"] * len(seats)

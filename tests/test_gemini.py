@@ -22,6 +22,14 @@ from backend.database import get_conn, init_db
 SIGNATURE = "c2lnbmF0dXJlLWZyb20tZ2VtaW5p"
 
 
+@pytest.fixture(autouse=True)
+def _reset_model_state():
+    chatbot._DISCOVERED_MODELS = None
+    chatbot._MODEL_COOLDOWN.clear()
+    chatbot._LAST_GOOD_MODEL = None
+    yield
+
+
 @pytest.fixture()
 def fake_gemini(monkeypatch):
     requests_seen = []
@@ -92,3 +100,82 @@ def test_history_starts_with_user(fake_gemini, conn):
     chatbot.chat(conn, [{"role": "assistant", "content": "안녕하세요"},
                         {"role": "user", "content": "로맨스 추천"}], None)
     assert seen[0]["contents"][0]["role"] == "user"
+
+
+def test_thinking_level_low_by_default(fake_gemini, conn):
+    seen, _ = fake_gemini
+    out = chatbot.chat(conn, [{"role": "user", "content": "로맨스 추천"}], None)
+    tc = seen[0]["generationConfig"]["thinkingConfig"]
+    assert (tc.get("thinkingLevel") or tc.get("thinking_level")) == "LOW"
+    assert out["llm_calls"] == 2 and out["elapsed"] >= 0
+
+
+def test_thinking_unsupported_model_retries_without_it(fake_gemini, conn, monkeypatch):
+    """thinking 설정을 거부(400)하는 모델이면 설정을 빼고 재시도해야 한다"""
+    seen, state = fake_gemini
+    real_handler_calls = []
+    import httpx as _httpx
+    orig_send = _httpx.Client.send
+
+    def send(self, request, **kw):
+        body = json.loads(request.content)
+        if "thinkingConfig" in body.get("generationConfig", {}):
+            real_handler_calls.append("rejected")
+            return _httpx.Response(400, json={"error": {"code": 400, "message": "thinking not supported",
+                                                        "status": "INVALID_ARGUMENT"}}, request=request)
+        return orig_send(self, request, **kw)
+
+    monkeypatch.setattr(_httpx.Client, "send", send)
+    out = chatbot.chat(conn, [{"role": "user", "content": "로맨스 추천"}], None)
+    assert real_handler_calls == ["rejected"]
+    assert out["engine"].startswith("gemini:") and "추천" in out["reply"]
+
+
+def test_overloaded_model_falls_back_to_other_gemini(monkeypatch, conn):
+    """기본 모델이 503(과부하)이면 모델 목록에서 가벼운 모델을 찾아 그 모델로 답해야 한다"""
+    chatbot._DISCOVERED_MODELS = None
+    hits = []
+
+    def handler(request: httpx.Request):
+        path = request.url.path
+        hits.append((request.method, path))
+        if request.method == "GET" and path.endswith("/models"):
+            return httpx.Response(200, json={"models": [
+                {"name": "models/gemini-9-pro", "supportedGenerationMethods": ["generateContent"]},
+                {"name": "models/gemini-9-flash-lite", "supportedGenerationMethods": ["generateContent"]},
+                {"name": "models/gemini-9-flash-image", "supportedGenerationMethods": ["generateContent"]},
+                {"name": "models/text-embedding-9", "supportedGenerationMethods": ["embedContent"]},
+            ]})
+        if "gemini-4-hydrogen" in path:
+            return httpx.Response(503, json={"error": {"code": 503, "message": "overloaded", "status": "UNAVAILABLE"}})
+        return httpx.Response(200, json={"candidates": [{"content": {"role": "model", "parts": [
+            {"text": "대체 모델이 답했어요"}]}, "finishReason": "STOP"}]})
+
+    real_client = genai.Client
+
+    def client_factory(*, api_key, http_options):
+        opts = http_options.model_copy(update={"httpx_client": httpx.Client(transport=httpx.MockTransport(handler)),
+                                               "retry_options": None})
+        return real_client(api_key=api_key, http_options=opts)
+
+    monkeypatch.setattr(genai, "Client", client_factory)
+    monkeypatch.setenv("GEMINI_API_KEY", "k")
+    monkeypatch.setenv("GEMINI_MODEL", "gemini-4-hydrogen")
+    out = chatbot.chat(conn, [{"role": "user", "content": "안녕"}], None)
+    assert out["engine"] == "gemini:gemini-9-flash-lite", out
+    assert out["reply"] == "대체 모델이 답했어요"
+
+    # 두 번째 질문: 실패한 기본 모델은 건너뛰고 곧바로 대체 모델로 가야 한다 (느린 재시도 없음)
+    hits.clear()
+    out = chatbot.chat(conn, [{"role": "user", "content": "또 안녕"}], None)
+    assert out["engine"] == "gemini:gemini-9-flash-lite"
+    assert not any("gemini-4-hydrogen" in p for _, p in hits), hits
+    chatbot._DISCOVERED_MODELS = None
+    chatbot._MODEL_COOLDOWN.clear()
+    chatbot._LAST_GOOD_MODEL = None
+
+
+def test_rule_greeting_has_no_key_warning_when_key_set(monkeypatch, conn):
+    monkeypatch.setenv("GEMINI_API_KEY", "k")
+    out = chatbot._rule_chat(conn, [{"role": "user", "content": "ㅎㅇ"}], None)
+    assert "키가 없어" not in out["reply"] and "예매해줘" in out["reply"]

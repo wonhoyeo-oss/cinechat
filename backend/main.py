@@ -68,6 +68,11 @@ class ChargeIn(BaseModel):
     amount: int = Field(gt=0, le=1_000_000)
 
 
+class WaitlistIn(BaseModel):
+    screening_id: int
+    seat_count: int = Field(ge=1, le=services.MAX_WAITLIST_SEATS)
+
+
 class ChatMessage(BaseModel):
     role: str = Field(pattern="^(user|assistant)$")
     content: str = Field(max_length=2000)
@@ -186,6 +191,33 @@ def charge(body: ChargeIn, user=Depends(auth.current_user), conn: sqlite3.Connec
 @app.get("/api/points/history", tags=["points"])
 def history(user=Depends(auth.current_user), conn: sqlite3.Connection = Depends(get_db)):
     return services.point_history(conn, user["id"])
+
+
+# ───────────────────────── 취소표 대기열 / 알림 ─────────────────────────
+@app.post("/api/waitlist", status_code=201, tags=["waitlist"])
+def join_waitlist(body: WaitlistIn, user=Depends(auth.current_user), conn: sqlite3.Connection = Depends(get_db)):
+    return services.join_waitlist(conn, user["id"], body.screening_id, body.seat_count)
+
+
+@app.get("/api/waitlist", tags=["waitlist"])
+def my_waitlist(user=Depends(auth.current_user), conn: sqlite3.Connection = Depends(get_db)):
+    return services.my_waitlist(conn, user["id"])
+
+
+@app.delete("/api/waitlist/{waitlist_id}", tags=["waitlist"])
+def cancel_waitlist(waitlist_id: int, user=Depends(auth.current_user), conn: sqlite3.Connection = Depends(get_db)):
+    return services.cancel_waitlist(conn, user["id"], waitlist_id)
+
+
+@app.get("/api/notifications", tags=["notifications"])
+def notifications(unread: bool = False, user=Depends(auth.current_user),
+                  conn: sqlite3.Connection = Depends(get_db)):
+    return services.my_notifications(conn, user["id"], only_unread=unread)
+
+
+@app.post("/api/notifications/read", tags=["notifications"])
+def read_notifications(user=Depends(auth.current_user), conn: sqlite3.Connection = Depends(get_db)):
+    return {"updated": services.mark_notifications_read(conn, user["id"])}
 
 
 # ───────────────────────── 챗봇 ─────────────────────────

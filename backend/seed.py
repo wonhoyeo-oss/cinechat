@@ -7,10 +7,12 @@ from . import external_api
 
 log = logging.getLogger("cinechat.seed")
 
-THEATERS = [("1관 (일반)", 8, 12), ("2관 (일반)", 8, 12), ("3관 (프리미엄)", 6, 10)]
+THEATERS = [("1관 (일반)", 8, 12), ("2관 (일반)", 8, 12), ("3관 (프리미엄)", 6, 10),
+            ("4관 (프라이빗)", 2, 5)]   # 10석 소규모관: 매진·취소표 자동 예매를 시연하기 쉬움
 SHOW_TIMES = ["10:00", "13:30", "16:40", "19:50", "22:30"]
 BASE_PRICE = 12_000
 PREMIUM_PRICE = 16_000
+PRIVATE_PRICE = 20_000
 SCHEDULE_DAYS = 3
 
 # API 키가 없을 때 사용하는 샘플 영화 (줄거리는 직접 작성한 짧은 소개)
@@ -116,7 +118,8 @@ def ensure_schedule(conn: sqlite3.Connection, days: int = SCHEDULE_DAYS):
                 # 앞 순위 영화일수록 자주 등장하도록 가중 순환
                 weighted = movie_ids[:4] * 2 + movie_ids
                 mid = weighted[slot % len(weighted)]
-                price = PREMIUM_PRICE if "프리미엄" in t["name"] else BASE_PRICE
+                price = (PREMIUM_PRICE if "프리미엄" in t["name"]
+                         else PRIVATE_PRICE if "프라이빗" in t["name"] else BASE_PRICE)
                 conn.execute(
                     "INSERT INTO screenings(movie_id, theater_id, starts_at, price) VALUES (?,?,?,?)",
                     (mid, t["id"], starts, price),

@@ -80,7 +80,8 @@ pytest -q
 | `backend/external_api.py` | TMDB 상영작/포스터, KOBIS 일별 박스오피스 |
 | `backend/seed.py` | 상영관·샘플 영화·상영 회차 자동 생성, 외부 데이터 동기화 |
 | `frontend/app.py` | Streamlit UI |
-| `tests/test_api.py` | API 통합 테스트 (동시 예매 경쟁 테스트 포함) |
+| `tests/` | 자동 테스트 22개 (동시 예매 경쟁, 대기열 FIFO·끼어들기 방지, Gemini 연동) |
+| `experiments/waitlist_experiment.py` | 논문용 실험: 제안 방식 vs 폴링 방식 비교 |
 
 ## 3. 데이터베이스 (ERD 요약)
 
@@ -88,7 +89,9 @@ pytest -q
 users ─┬─< sessions
        ├─< bookings >── screenings >── movies
        │      └─< booking_seats (UNIQUE screening_id+seat_code)
-       └─< point_history                  screenings >── theaters
+       ├─< point_history                  screenings >── theaters
+       ├─< waitlist >── screenings   (대기 중 신청은 사용자·회차당 1개: 부분 UNIQUE 인덱스)
+       └─< notifications
 ```
 
 ## 4. 핵심 구현 포인트
@@ -101,10 +104,27 @@ users ─┬─< sessions
 
 `tests/test_api.py::test_concurrent_same_seat_only_one_wins` 에서 **20명이 동시에 같은 좌석을 예매하면 정확히 1명만 성공**하는 것을 검증합니다.
 
-### ② LLM Function Calling 챗봇 (Google Gemini)
+### ② 매진 대기열 · 취소표 자동 예매 (차별화 기능)
+매진 회차에 대기 신청을 해두면, 누군가 예매를 취소하는 순간 **신청 순서대로 자동 예매 + 포인트 자동 결제 + 알림**까지 처리합니다.
+
+- **원자적 재배정**: 예매 취소 트랜잭션 안에서 `좌석 반환 → 대기자 배정 → 자동 결제`를 한 번에 처리합니다. 취소와 재배정 사이에 틈이 없어서 대기하지 않은 사용자(매크로 등)가 반환 좌석을 가로챌 수 없습니다.
+- **FIFO + 좌석 수 적합 우선**: 신청 순서대로 배정하되, 맨 앞 대기자가 원하는 좌석 수만큼 자리가 없으면 그 사람의 순번은 유지한 채 조건이 맞는 다음 대기자에게 먼저 배정합니다.
+- **부분 실패 격리**: 대기자의 포인트가 부족하면 `SAVEPOINT`로 그 사람 결제만 되돌리고 '실패'로 기록한 뒤 다음 대기자에게 넘어갑니다.
+- **시연용 4관(프라이빗, 10석)**: 매진·취소표 상황을 쉽게 재현할 수 있도록 소규모 상영관을 두었습니다.
+
+**실험** (`python experiments/waitlist_experiment.py`): 10석 매진 → 대기자 N명 → 취소 5건과 끼어들기 시도자 20명이 동시에 발생
+
+| 방식 | 대기자 수 | 끼어들기 성공(석) | 순서 위반 | 중복 배정 | 대기자 배정(석/5) | 취소 응답(ms) |
+| --- | --- | --- | --- | --- | --- | --- |
+| 제안(원자적 재배정) | 10 / 50 / 100 / 200 | 0 / 0 / 0 / 0 | 0 | 0 | 5 / 5 / 5 / 5 | 18.9 / 15.4 / 22.9 / 28.8 |
+| 비교(폴링 100ms) | 10 / 50 / 100 / 200 | 5 / 5 / 5 / 5 | 0 | 0 | 0 / 0 / 0 / 0 | 18.8 / 16.3 / 10.4 / 38.2 |
+
+비교 방식은 확인 주기를 10ms·1ms로 줄여도 반환 좌석 5석 중 평균 2.5~4.5석을 끼어들기에 빼앗겼습니다(대기자 10·50명, 각 2회 측정). 수치는 실행 환경마다 조금씩 다르며, 원자료는 `experiments/results/`에 저장됩니다.
+
+### ③ LLM Function Calling 챗봇 (Google Gemini)
 Google 공식 `google-genai` SDK로 연동합니다. 모델 응답을 대화 기록에 그대로 다시 넣어 Gemini 3의 thought signature(도구 호출 사이 추론 맥락)를 보존하므로, 검색 → 회차 조회 → 결제처럼 여러 번 이어지는 도구 호출도 안정적으로 동작합니다.
 
-LLM이 DB에 직접 접근하지 않고 정의된 7개 도구만 호출합니다 → 없는 영화를 지어내는 환각 방지 + 예매는 검증된 트랜잭션 로직 사용.
+LLM이 DB에 직접 접근하지 않고 정의된 9개 도구만 호출합니다 → 없는 영화를 지어내는 환각 방지 + 예매는 검증된 트랜잭션 로직 사용.
 
 | 도구 | 기능 |
 |---|---|
@@ -115,14 +135,16 @@ LLM이 DB에 직접 접근하지 않고 정의된 7개 도구만 호출합니다
 | `open_booking_screen` | 화면의 좌석 선택 창 열기 (좌석 미리 선택) |
 | `book_seats` | 사용자가 동의하면 실제 모의 결제 |
 | `get_my_bookings` | 예매 내역·포인트 조회 |
+| `join_waitlist` | 매진 회차 취소표 대기 신청 (사용자 동의 후) |
+| `get_my_waitlist` | 대기 순번·상태 조회 |
 
-예시 대화: *"비 오는 날 혼자 보기 좋은 영화"*, *"인셉션 내일 저녁 7시 두 명 예매해줘"*, *"응 그걸로 결제해줘"*
+예시 대화: *"비 오는 날 혼자 보기 좋은 영화"*, *"내일 저녁 7시 두 명 예매해줘"*, *"매진이면 대기 걸어줘"*, *"내 대기 순번 알려줘"*
 
-### ③ 쿠키·세션 인증
+### ④ 쿠키·세션 인증
 - 비밀번호: PBKDF2-HMAC-SHA256, 사용자별 salt, 200,000회 반복
 - 로그인 시 `secrets.token_urlsafe(32)` 토큰을 `sessions` 테이블에 저장, `HttpOnly; SameSite=Lax` 쿠키로 전달 (12시간 만료)
 
-### ④ 외부 데이터 연동
+### ⑤ 외부 데이터 연동
 - 서버 시작 시(또는 `POST /api/admin/sync`) TMDB 현재 상영작 + KOBIS 전일 박스오피스를 받아와 DB에 upsert
 - KOBIS 영화는 TMDB 제목 검색으로 포스터·줄거리를 보강
 - 외부 API 장애 시 기존 데이터로 계속 서비스 (장애 격리)
@@ -138,6 +160,8 @@ LLM이 DB에 직접 접근하지 않고 정의된 7개 도구만 호출합니다
 | GET | `/api/screenings/{id}/seats` | 좌석 맵 |
 | POST · GET · DELETE | `/api/bookings` · `/api/bookings/{id}` | 예매 / 내역 / 취소(환불) |
 | POST · GET | `/api/points/charge` · `/api/points/history` | 포인트 충전 / 이력 |
+| POST · GET · DELETE | `/api/waitlist` · `/api/waitlist/{id}` | 취소표 대기 신청 / 내 대기 목록 / 대기 취소 |
+| GET · POST | `/api/notifications` · `/api/notifications/read` | 알림 조회 / 읽음 처리 |
 | POST | `/api/chat` | 챗봇 대화 |
 
 ## 6. 참고문헌

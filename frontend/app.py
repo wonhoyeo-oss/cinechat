@@ -16,6 +16,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 API = os.getenv("API_URL", "http://localhost:8000")
+services_max_wait = 4   # 한 번에 대기 신청 가능한 최대 좌석 수 (backend MAX_WAITLIST_SEATS 와 동일)
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 st.set_page_config(page_title="CineChat · AI 영화 예매", page_icon="🎬", layout="wide")
@@ -262,6 +263,14 @@ with st.sidebar:
         refresh_user()
 
     if ss.user:
+        # 🔔 알림: 안 읽은 알림(취소표 자동 예매 완료 등)은 토스트로 띄우고 읽음 처리
+        unread, _ = api("GET", "/api/notifications", params={"unread": "true"})
+        if unread:
+            for n in reversed(unread):
+                st.toast(n["message"], icon="🔔")
+            api("POST", "/api/notifications/read")
+            refresh_user()          # 자동 결제로 포인트가 바뀌었을 수 있음
+    if ss.user:
         u = ss.user
         st.success(f"**{u['nickname']}**님 환영합니다")
         st.metric("보유 포인트", f"{u['points']:,} P")
@@ -276,6 +285,30 @@ with st.sidebar:
                     ss.flash = f"{won(amt)} 충전 완료!"
                     refresh_user()
                     st.rerun()
+        notes, _ = api("GET", "/api/notifications")
+        with st.expander(f"🔔 알림{f' ({len(unread)} 새 알림)' if unread else ''}", expanded=bool(unread)):
+            if not notes:
+                st.caption("알림이 없습니다.")
+            for n in (notes or [])[:8]:
+                st.markdown(f"{n['message']}  \n<span style='opacity:.6;font-size:.75rem'>{n['created_at']}</span>",
+                            unsafe_allow_html=True)
+        with st.expander("⏳ 취소표 대기", expanded=False):
+            wl, _ = api("GET", "/api/waitlist")
+            if not wl:
+                st.caption("대기 신청 내역이 없습니다. 매진 회차에서 대기 신청을 할 수 있어요.")
+            status_label = {"WAITING": "⏳ 대기 중", "FULFILLED": "✅ 자동 예매 완료", "FAILED": "⚠️ 실패",
+                            "CANCELLED": "취소함", "EXPIRED": "만료"}
+            for w in wl or []:
+                pos = f" · **{w['position']}번째**" if w["position"] else ""
+                st.markdown(f"**{w['title']}**  \n{w['starts_at']} · {w['theater']} · {w['seat_count']}석  \n"
+                            f"{status_label.get(w['status'], w['status'])}{pos}"
+                            + (f"  \n<span style='opacity:.7;font-size:.8rem'>{w['fail_reason']}</span>"
+                               if w.get("fail_reason") else ""), unsafe_allow_html=True)
+                if w["status"] == "WAITING" and st.button("대기 취소", key=f"wlc{w['id']}"):
+                    _, err = api("DELETE", f"/api/waitlist/{w['id']}")
+                    ss.flash = err or "대기 신청을 취소했어요."
+                    st.rerun()
+                st.divider()
         with st.expander("🎟️ 내 예매 내역", expanded=False):
             bookings, _ = api("GET", "/api/bookings")
             if not bookings:
@@ -286,8 +319,10 @@ with st.sidebar:
                             f"{b['starts_at']} · {b['theater']}  \n"
                             f"{', '.join(b['seats']) if b['seats'] else '취소됨'} · {won(b['total_price'])}")
                 if not cancelled and st.button("예매 취소", key=f"cancel{b['id']}"):
-                    _, err = api("DELETE", f"/api/bookings/{b['id']}")
-                    ss.flash = err or "예매가 취소되고 포인트가 환불되었습니다."
+                    res, err = api("DELETE", f"/api/bookings/{b['id']}")
+                    n_re = (res or {}).get("reassigned_to_waitlist", 0)
+                    ss.flash = err or ("예매가 취소되고 포인트가 환불되었습니다."
+                                       + (f" 반환된 좌석은 대기자 {n_re}명에게 자동 예매되었어요." if n_re else ""))
                     refresh_user()
                     st.rerun()
                 st.divider()
@@ -405,6 +440,9 @@ with chat_col:
             action = data.get("action") or {}
             if action.get("type") == "open_booking":
                 open_booking(screening_id=action["screening_id"], seats=action.get("seats"))
+            elif action.get("type") == "waitlisted":
+                ss.flash = "⏳ 챗봇을 통해 취소표 대기 신청이 완료되었어요!"
+                open_booking(screening_id=action["screening_id"])
             elif action.get("type") == "booked":
                 ss.flash = "🎉 챗봇을 통해 예매가 완료되었습니다!"
                 ss.screening_id = data["booking"]["screening_id"]
@@ -441,7 +479,9 @@ with book_col:
             date = st.radio("날짜", dates, index=dates.index(cur_date), horizontal=True,
                             format_func=lambda d: f"{int(d[5:7])}/{int(d[8:10])}")
             day_shows = [s for s in shows if s["starts_at"].startswith(date)]
-            labels = {s["id"]: f"{s['starts_at'][11:]} {s['theater']} · 잔여 {s['remaining_seats']}석" for s in day_shows}
+            labels = {s["id"]: f"{s['starts_at'][11:]} {s['theater']} · "
+                               + ("매진 (취소표 대기 가능)" if s["remaining_seats"] == 0 else f"잔여 {s['remaining_seats']}석")
+                      for s in day_shows}
             ids = list(labels)
             idx = ids.index(ss.screening_id) if ss.screening_id in ids else 0
             sid = st.selectbox("상영 회차", ids, index=idx, format_func=labels.get)
@@ -473,6 +513,30 @@ with book_col:
                                       type="primary" if is_sel else "secondary", use_container_width=True):
                         ss.selected.symmetric_difference_update({code})
                         st.rerun()
+
+            # ⏳ 취소표 대기 신청: 매진이거나 남은 좌석이 4석 미만일 때 표시
+            if seatmap["remaining"] < services_max_wait:
+                box = st.container(border=True, key="waitbox")
+                if seatmap["remaining"] == 0:
+                    box.markdown("#### 😢 매진된 회차예요")
+                else:
+                    box.markdown(f"#### 남은 좌석이 {seatmap['remaining']}석뿐이에요")
+                box.caption(f"취소표 대기를 걸어두면 누군가 취소할 때 **신청 순서대로 자동 예매되고 포인트가 자동 결제**돼요. "
+                            f"현재 대기 {seatmap['waiting']}명")
+                wc1, wc2 = box.columns([1, 2])
+                min_n = seatmap["remaining"] + 1
+                n_wait = wc1.number_input("인원", min_value=min_n, max_value=services_max_wait, value=min_n,
+                                          key=f"wn{sid}")
+                if wc2.button(f"⏳ {n_wait}석 취소표 대기 신청 (자동 결제 {won(scr['price'] * n_wait)})",
+                              use_container_width=True, disabled=not ss.user, key=f"wb{sid}"):
+                    w, err = api("POST", "/api/waitlist", json={"screening_id": sid, "seat_count": int(n_wait)})
+                    if err:
+                        box.error(err)
+                    else:
+                        ss.flash = f"⏳ 대기 신청 완료! 현재 {w['position']}번째예요. 취소표가 나오면 알려드릴게요."
+                        st.rerun()
+                if not ss.user:
+                    box.caption("대기 신청은 로그인 후 이용할 수 있어요.")
 
             sel = sorted(ss.selected)
             total = scr["price"] * len(sel)

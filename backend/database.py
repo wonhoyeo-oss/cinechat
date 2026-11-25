@@ -1,6 +1,6 @@
 """SQLite 연결 및 스키마 정의.
 
-테이블 구조 (3정규형 기준)
+테이블 구조 (3정규형 기준, 10개)
 - users           : 회원 정보 + 가상 포인트 잔액
 - sessions        : 쿠키 기반 로그인 세션
 - movies          : 영화 메타데이터 (TMDB / KOBIS / 샘플)
@@ -9,6 +9,8 @@
 - bookings        : 예매 내역 (한 번의 결제 단위)
 - booking_seats   : 예매된 좌석. UNIQUE(screening_id, seat_code) 로 중복 예매를 DB 레벨에서 차단
 - point_history   : 포인트 충전/결제/환불 이력 (가상 결제 로그)
+- waitlist        : 매진 회차 대기 신청 (취소표 자동 예매 대기열)
+- notifications   : 사용자 알림
 """
 import os
 import sqlite3
@@ -92,6 +94,33 @@ CREATE TABLE IF NOT EXISTS point_history (
     booking_id INTEGER REFERENCES bookings(id),
     created_at TEXT    NOT NULL DEFAULT (datetime('now','localtime'))
 );
+
+-- 매진 회차 대기열: 취소표가 나오면 신청 순서(id 오름차순)대로 자동 예매
+CREATE TABLE IF NOT EXISTS waitlist (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id      INTEGER NOT NULL REFERENCES users(id),
+    screening_id INTEGER NOT NULL REFERENCES screenings(id),
+    seat_count   INTEGER NOT NULL CHECK (seat_count BETWEEN 1 AND 4),
+    status       TEXT    NOT NULL DEFAULT 'WAITING'
+                 CHECK (status IN ('WAITING','FULFILLED','FAILED','CANCELLED','EXPIRED')),
+    booking_id   INTEGER REFERENCES bookings(id),
+    fail_reason  TEXT,
+    created_at   TEXT    NOT NULL DEFAULT (datetime('now','localtime')),
+    closed_at    TEXT
+);
+-- 한 사람은 같은 회차에 '대기 중' 신청을 하나만 가질 수 있음 (부분 고유 인덱스)
+CREATE UNIQUE INDEX IF NOT EXISTS uq_waitlist_active ON waitlist(user_id, screening_id) WHERE status = 'WAITING';
+CREATE INDEX IF NOT EXISTS idx_waitlist_queue ON waitlist(screening_id, status, id);
+
+-- 사용자 알림 (취소표 자동 예매 완료/실패, 대기 만료 등)
+CREATE TABLE IF NOT EXISTS notifications (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id    INTEGER NOT NULL REFERENCES users(id),
+    message    TEXT    NOT NULL,
+    is_read    INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT    NOT NULL DEFAULT (datetime('now','localtime'))
+);
+CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(user_id, is_read, id);
 
 CREATE INDEX IF NOT EXISTS idx_screenings_movie ON screenings(movie_id, starts_at);
 CREATE INDEX IF NOT EXISTS idx_bookings_user    ON bookings(user_id, created_at);
