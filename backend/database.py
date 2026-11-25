@@ -28,6 +28,8 @@ CREATE TABLE IF NOT EXISTS users (
     salt          TEXT    NOT NULL,
     nickname      TEXT    NOT NULL,
     points        INTEGER NOT NULL DEFAULT 0 CHECK (points >= 0),
+    telegram_chat_id   TEXT,                          -- 메신저(텔레그램) 알림을 받을 대화방
+    telegram_link_code TEXT,                          -- 연결용 1회용 코드
     created_at    TEXT    NOT NULL DEFAULT (datetime('now','localtime'))
 );
 
@@ -118,6 +120,7 @@ CREATE TABLE IF NOT EXISTS notifications (
     user_id    INTEGER NOT NULL REFERENCES users(id),
     message    TEXT    NOT NULL,
     is_read    INTEGER NOT NULL DEFAULT 0,
+    sent_at    TEXT,                                  -- 메신저 발송 시각 (NULL = 아직 안 보냄)
     created_at TEXT    NOT NULL DEFAULT (datetime('now','localtime'))
 );
 CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(user_id, is_read, id);
@@ -157,6 +160,16 @@ def get_db():
         conn.close()
 
 
+def _add_column_if_missing(conn, table: str, column: str, ddl: str):
+    cols = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+    if column not in cols:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+
+
 def init_db():
     with get_conn() as conn:
         conn.executescript(SCHEMA)
+        # 이전 버전 DB 에 새 컬럼 추가 (배포 서버의 기존 데이터 유지)
+        _add_column_if_missing(conn, "users", "telegram_chat_id", "TEXT")
+        _add_column_if_missing(conn, "users", "telegram_link_code", "TEXT")
+        _add_column_if_missing(conn, "notifications", "sent_at", "TEXT")

@@ -51,7 +51,7 @@ def current_user_optional(
     if not cinechat_session:
         return None
     row = conn.execute(
-        """SELECT u.id, u.username, u.nickname, u.points
+        """SELECT u.id, u.username, u.nickname, u.points, (u.telegram_chat_id IS NOT NULL) AS telegram_linked
              FROM sessions s JOIN users u ON u.id = s.user_id
             WHERE s.token = ? AND s.expires_at > datetime('now','localtime')""",
         (cinechat_session,),

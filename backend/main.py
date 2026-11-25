@@ -19,7 +19,7 @@ try:
 except ImportError:
     pass
 
-from . import auth, chatbot, seed, services
+from . import auth, chatbot, notifier, seed, services
 from .database import get_conn, get_db, init_db
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -220,6 +220,32 @@ def read_notifications(user=Depends(auth.current_user), conn: sqlite3.Connection
     return {"updated": services.mark_notifications_read(conn, user["id"])}
 
 
+# ───────────────────────── 메신저(텔레그램) 알림 연결 ─────────────────────────
+@app.post("/api/telegram/link", tags=["notifications"])
+def telegram_link(user=Depends(auth.current_user), conn: sqlite3.Connection = Depends(get_db)):
+    try:
+        return notifier.create_link(conn, user["id"])
+    except RuntimeError as e:
+        raise HTTPException(503, str(e))
+
+
+@app.post("/api/telegram/confirm", tags=["notifications"])
+def telegram_confirm(user=Depends(auth.current_user), conn: sqlite3.Connection = Depends(get_db)):
+    try:
+        linked = notifier.confirm_link(conn, user["id"])
+    except Exception as e:
+        raise HTTPException(503, f"텔레그램 서버에 연결할 수 없습니다: {e}")
+    if linked:
+        notifier.dispatch_async()
+    return {"linked": linked}
+
+
+@app.delete("/api/telegram", tags=["notifications"])
+def telegram_unlink(user=Depends(auth.current_user), conn: sqlite3.Connection = Depends(get_db)):
+    notifier.unlink(conn, user["id"])
+    return {"linked": False}
+
+
 # ───────────────────────── 챗봇 ─────────────────────────
 @app.post("/api/chat", tags=["chat"])
 def chat(body: ChatIn, user=Depends(auth.current_user_optional), conn: sqlite3.Connection = Depends(get_db)):
@@ -240,4 +266,5 @@ def sync(request: Request, conn: sqlite3.Connection = Depends(get_db)):
 @app.get("/api/health", tags=["admin"])
 def health():
     return {"ok": True, "llm": (chatbot.llm_config() or {}).get("provider", "rule-based"),
-            "tmdb": bool(os.getenv("TMDB_API_KEY")), "kobis": bool(os.getenv("KOBIS_API_KEY"))}
+            "tmdb": bool(os.getenv("TMDB_API_KEY")), "kobis": bool(os.getenv("KOBIS_API_KEY")),
+            "telegram": notifier.enabled()}

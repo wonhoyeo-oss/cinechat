@@ -194,6 +194,8 @@ def create_booking(conn: sqlite3.Connection, user_id: int, screening_id: int, se
     conn.execute("BEGIN IMMEDIATE")          # ← 쓰기 잠금 선점
     try:
         booking_id = _book_in_tx(conn, user_id, scr, seats, "예매 결제")
+        _notify(conn, user_id, f"✅ 예매 완료! '{scr['title']}' {scr['starts_at']} {scr['theater']} "
+                               f"좌석 {', '.join(seats)} ({scr['price'] * len(seats):,}P 결제)", read=True)
         conn.execute("COMMIT")
     except sqlite3.IntegrityError:
         conn.execute("ROLLBACK")
@@ -201,7 +203,7 @@ def create_booking(conn: sqlite3.Connection, user_id: int, screening_id: int, se
     except Exception:
         conn.execute("ROLLBACK")
         raise
-
+    _after_commit()
     return get_booking(conn, booking_id, user_id)
 
 
@@ -228,10 +230,13 @@ def cancel_booking(conn: sqlite3.Connection, user_id: int, booking_id: int) -> d
         )
         # 반환된 좌석을 같은 트랜잭션 안에서 대기자에게 즉시 재배정 (끼어들기 방지)
         assigned = _process_waitlist(conn, b["screening_id"])
+        _notify(conn, user_id, f"↩️ 예매가 취소되고 {b['total_price']:,}P가 환불되었어요. (예매 번호 {booking_id})",
+                read=True)
         conn.execute("COMMIT")
     except Exception:
         conn.execute("ROLLBACK")
         raise
+    _after_commit()
     result = get_booking(conn, booking_id, user_id)
     result["reassigned_to_waitlist"] = len(assigned)
     return result
@@ -307,8 +312,16 @@ def suggest_seats(seatmap: dict, count: int) -> list[str]:
 
 
 # ───────────────────────── 매진 대기열 ─────────────────────────
-def _notify(conn, user_id: int, message: str):
-    conn.execute("INSERT INTO notifications(user_id, message) VALUES (?,?)", (user_id, message))
+def _notify(conn, user_id: int, message: str, read: bool = False):
+    """알림 기록 (트랜잭션 안에서 호출). read=True 는 본인이 방금 한 행동이라 사이트 팝업은 생략하고 메신저로만 보냄."""
+    conn.execute("INSERT INTO notifications(user_id, message, is_read) VALUES (?,?,?)",
+                 (user_id, message, 1 if read else 0))
+
+
+def _after_commit():
+    """커밋된 알림을 메신저로 발송 (백그라운드). 예매 처리 시간에 영향을 주지 않는다."""
+    from . import notifier
+    notifier.dispatch_async()
 
 
 def _expire_started(conn):
@@ -390,6 +403,10 @@ def join_waitlist(conn, user_id: int, screening_id: int, seat_count: int) -> dic
             "INSERT INTO waitlist(user_id, screening_id, seat_count) VALUES (?,?,?)",
             (user_id, screening_id, seat_count),
         ).lastrowid
+        pos = conn.execute("SELECT COUNT(*) FROM waitlist WHERE screening_id=? AND status='WAITING' AND id<=?",
+                           (screening_id, wid)).fetchone()[0]
+        _notify(conn, user_id, f"⏳ 취소표 대기 신청 완료: '{scr['title']}' {scr['starts_at']} {seat_count}석, "
+                               f"현재 {pos}번째. 취소표가 나오면 자동 예매해 드릴게요.", read=True)
         conn.execute("COMMIT")
     except sqlite3.IntegrityError:
         conn.execute("ROLLBACK")
@@ -397,6 +414,7 @@ def join_waitlist(conn, user_id: int, screening_id: int, seat_count: int) -> dic
     except Exception:
         conn.execute("ROLLBACK")
         raise
+    _after_commit()
     return get_waitlist_entry(conn, wid, user_id)
 
 
@@ -440,6 +458,7 @@ def my_waitlist(conn, user_id: int) -> list[dict]:
     except Exception:
         conn.execute("ROLLBACK")
         raise
+    _after_commit()
     ids = conn.execute("SELECT id FROM waitlist WHERE user_id=? ORDER BY id DESC LIMIT 20", (user_id,)).fetchall()
     return [get_waitlist_entry(conn, r[0], user_id) for r in ids]
 

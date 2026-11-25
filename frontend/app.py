@@ -258,7 +258,8 @@ with st.sidebar:
     if health:
         llm_name = {"openai": "OpenAI", "gemini": "Gemini (무료)"}.get(health["llm"], "키워드 모드")
         st.caption(f"AI 엔진: **{llm_name}** · "
-                   f"TMDB {'✅' if health['tmdb'] else '—'} · KOBIS {'✅' if health['kobis'] else '—'}")
+                   f"TMDB {'✅' if health['tmdb'] else '—'} · KOBIS {'✅' if health['kobis'] else '—'} · "
+                   f"텔레그램 {'✅' if health.get('telegram') else '—'}")
     if ss.user is None:
         refresh_user()
 
@@ -309,6 +310,35 @@ with st.sidebar:
                     ss.flash = err or "대기 신청을 취소했어요."
                     st.rerun()
                 st.divider()
+        with st.expander("📱 메신저 알림 (텔레그램)", expanded=False):
+            if not (health or {}).get("telegram"):
+                st.caption("관리자가 텔레그램 봇 토큰(TELEGRAM_BOT_TOKEN)을 설정하면 사용할 수 있어요.")
+            elif u.get("telegram_linked"):
+                st.success("연결됨 ✅ 예매 완료·취소, 취소표 자동 예매 소식을 텔레그램으로 보내드려요.")
+                if st.button("연결 해제", key="tg-unlink"):
+                    api("DELETE", "/api/telegram")
+                    refresh_user()
+                    st.rerun()
+            else:
+                st.caption("① 링크를 눌러 텔레그램에서 **시작**을 누르고 ② 돌아와서 **연결 확인**을 눌러 주세요.")
+                if st.button("연결 링크 만들기", key="tg-link", use_container_width=True):
+                    link, err = api("POST", "/api/telegram/link")
+                    ss.tg_link = (link or {}).get("url")
+                    if err:
+                        st.error(err)
+                if ss.get("tg_link"):
+                    st.link_button("📲 텔레그램에서 열기", ss.tg_link, use_container_width=True)
+                    if st.button("연결 확인", key="tg-confirm", use_container_width=True):
+                        res, err = api("POST", "/api/telegram/confirm")
+                        if err:
+                            st.error(err)
+                        elif res["linked"]:
+                            ss.tg_link = None
+                            ss.flash = "📱 텔레그램 알림이 연결되었어요!"
+                            refresh_user()
+                            st.rerun()
+                        else:
+                            st.warning("아직 확인되지 않았어요. 텔레그램에서 '시작'을 눌렀는지 확인해 주세요.")
         with st.expander("🎟️ 내 예매 내역", expanded=False):
             bookings, _ = api("GET", "/api/bookings")
             if not bookings:

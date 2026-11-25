@@ -80,7 +80,8 @@ pytest -q
 | `backend/external_api.py` | TMDB 상영작/포스터, KOBIS 일별 박스오피스 |
 | `backend/seed.py` | 상영관·샘플 영화·상영 회차 자동 생성, 외부 데이터 동기화 |
 | `frontend/app.py` | Streamlit UI |
-| `tests/` | 자동 테스트 22개 (동시 예매 경쟁, 대기열 FIFO·끼어들기 방지, Gemini 연동) |
+| `backend/notifier.py` | 텔레그램 메신저 알림 연결·발송 |
+| `tests/` | 자동 테스트 28개 (동시 예매 경쟁, 대기열 FIFO·끼어들기 방지, Gemini 연동, 텔레그램 알림) |
 | `experiments/waitlist_experiment.py` | 논문용 실험: 제안 방식 vs 폴링 방식 비교 |
 
 ## 3. 데이터베이스 (ERD 요약)
@@ -91,7 +92,7 @@ users ─┬─< sessions
        │      └─< booking_seats (UNIQUE screening_id+seat_code)
        ├─< point_history                  screenings >── theaters
        ├─< waitlist >── screenings   (대기 중 신청은 사용자·회차당 1개: 부분 UNIQUE 인덱스)
-       └─< notifications
+       └─< notifications (sent_at: 메신저 발송 여부)
 ```
 
 ## 4. 핵심 구현 포인트
@@ -121,7 +122,16 @@ users ─┬─< sessions
 
 비교 방식은 확인 주기를 10ms·1ms로 줄여도 반환 좌석 5석 중 평균 2.5~4.5석을 끼어들기에 빼앗겼습니다(대기자 10·50명, 각 2회 측정). 수치는 실행 환경마다 조금씩 다르며, 원자료는 `experiments/results/`에 저장됩니다.
 
-### ③ LLM Function Calling 챗봇 (Google Gemini)
+### ③ 메신저(텔레그램) 알림
+예매 완료 · 예매 취소 · 대기 신청 · **취소표 자동 예매 완료/실패** · 대기 만료 소식을 사이트 알림과 텔레그램으로 보냅니다.
+
+- 알림 기록은 예매와 **같은 트랜잭션**에 저장하고, 실제 발송은 **커밋 이후 백그라운드 스레드**에서 합니다. 텔레그램이 느리거나 장애가 나도 예매 처리는 지연되지 않습니다.
+- 발송 실패한 알림은 `sent_at`이 비어 있는 채로 남아 다음 발송 때 다시 보냅니다. 같은 알림이 두 번 가지 않도록 발송 전에 선점(`sent_at='sending'`)합니다.
+- 사용자 연결은 1회용 코드 링크(`t.me/<봇>?start=<코드>`) → 텔레그램에서 '시작' → 사이트에서 '연결 확인' 순서입니다. 웹훅 서버가 필요 없어 무료 호스팅에서도 동작합니다.
+
+**설정:** 텔레그램에서 `@BotFather` → `/newbot` → 받은 토큰을 `.env`(또는 Streamlit Secrets)의 `TELEGRAM_BOT_TOKEN`에 넣습니다.
+
+### ④ LLM Function Calling 챗봇 (Google Gemini)
 Google 공식 `google-genai` SDK로 연동합니다. 모델 응답을 대화 기록에 그대로 다시 넣어 Gemini 3의 thought signature(도구 호출 사이 추론 맥락)를 보존하므로, 검색 → 회차 조회 → 결제처럼 여러 번 이어지는 도구 호출도 안정적으로 동작합니다.
 
 LLM이 DB에 직접 접근하지 않고 정의된 9개 도구만 호출합니다 → 없는 영화를 지어내는 환각 방지 + 예매는 검증된 트랜잭션 로직 사용.
@@ -140,11 +150,11 @@ LLM이 DB에 직접 접근하지 않고 정의된 9개 도구만 호출합니다
 
 예시 대화: *"비 오는 날 혼자 보기 좋은 영화"*, *"내일 저녁 7시 두 명 예매해줘"*, *"매진이면 대기 걸어줘"*, *"내 대기 순번 알려줘"*
 
-### ④ 쿠키·세션 인증
+### ⑤ 쿠키·세션 인증
 - 비밀번호: PBKDF2-HMAC-SHA256, 사용자별 salt, 200,000회 반복
 - 로그인 시 `secrets.token_urlsafe(32)` 토큰을 `sessions` 테이블에 저장, `HttpOnly; SameSite=Lax` 쿠키로 전달 (12시간 만료)
 
-### ⑤ 외부 데이터 연동
+### ⑥ 외부 데이터 연동
 - 서버 시작 시(또는 `POST /api/admin/sync`) TMDB 현재 상영작 + KOBIS 전일 박스오피스를 받아와 DB에 upsert
 - KOBIS 영화는 TMDB 제목 검색으로 포스터·줄거리를 보강
 - 외부 API 장애 시 기존 데이터로 계속 서비스 (장애 격리)
@@ -162,6 +172,7 @@ LLM이 DB에 직접 접근하지 않고 정의된 9개 도구만 호출합니다
 | POST · GET | `/api/points/charge` · `/api/points/history` | 포인트 충전 / 이력 |
 | POST · GET · DELETE | `/api/waitlist` · `/api/waitlist/{id}` | 취소표 대기 신청 / 내 대기 목록 / 대기 취소 |
 | GET · POST | `/api/notifications` · `/api/notifications/read` | 알림 조회 / 읽음 처리 |
+| POST · POST · DELETE | `/api/telegram/link` · `/confirm` · `/api/telegram` | 텔레그램 연결 링크 / 연결 확인 / 해제 |
 | POST | `/api/chat` | 챗봇 대화 |
 
 ## 6. 참고문헌
